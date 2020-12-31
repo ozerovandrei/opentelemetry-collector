@@ -34,10 +34,8 @@ import (
 
 var (
 	// ZipkinV1 friendly conversion errors
-	msgZipkinV1JSONUnmarshalError = "zipkinv1"
-	msgZipkinV1TraceIDError       = "zipkinV1 span traceId"
-	msgZipkinV1SpanIDError        = "zipkinV1 span id"
-	msgZipkinV1ParentIDError      = "zipkinV1 span parentId"
+	msgZipkinV1JSONUnmarshalError = "zipkinV1"
+	msgZipkinV1BinAnnotationError = "zipkinV1 span binary annotation"
 	// Generic hex to ID conversion errors
 	errHexTraceIDWrongLen = errors.New("hex traceId span has wrong length (expected 16 or 32)")
 	errHexTraceIDParsing  = errors.New("failed to parse hex traceId")
@@ -85,27 +83,333 @@ type binaryAnnotation struct {
 	Endpoint *endpoint `json:"endpoint"`
 }
 
-// v1JSONBatchToOCProto converts a JSON blob with a list of Zipkin v1 spans to OC Proto.
-func v1JSONBatchToOCProto(blob []byte, parseStringTags bool) ([]consumerdata.TraceData, error) {
+func v1JSONBatchToZipkinV1Spans(blob []byte) ([]*zipkinV1Span, error) {
 	var zSpans []*zipkinV1Span
 	if err := json.Unmarshal(blob, &zSpans); err != nil {
 		return nil, fmt.Errorf("%s: %w", msgZipkinV1JSONUnmarshalError, err)
 	}
 
-	ocSpansAndParsedAnnotations := make([]ocSpanAndParsedAnnotations, 0, len(zSpans))
-	for _, zSpan := range zSpans {
-		ocSpan, parsedAnnotations, err := zipkinV1ToOCSpan(zSpan, parseStringTags)
-		if err != nil {
-			// error from internal package function, it already wraps the error to give better context.
-			return nil, err
-		}
-		ocSpansAndParsedAnnotations = append(ocSpansAndParsedAnnotations, ocSpanAndParsedAnnotations{
-			ocSpan:            ocSpan,
-			parsedAnnotations: parsedAnnotations,
-		})
+	return zSpans, nil
+}
+
+func zipkinV1SpanToInternal(zSpan *zipkinV1Span, parseStringTags bool, dest pdata.Span) error {
+	if err := zipkinV1SpanIDsToInternal(zSpan, dest); err != nil {
+		return err
 	}
 
-	return zipkinToOCProtoBatch(ocSpansAndParsedAnnotations)
+	parsedAnnotations := parseV1Annotations(zSpan.Annotations)
+	localComponent, err := parseV1BinAnnotations(zSpan.BinaryAnnotations, parseStringTags, dest)
+	if err != nil {
+		return err
+	}
+	if parsedAnnotations.endpoint.ServiceName == unknownServiceName && localComponent != "" {
+		parsedAnnotations.endpoint.ServiceName = localComponent
+	}
+
+	dest.SetKind(parsedAnnotations.kind)
+	dest.SetName(zSpan.Name)
+
+	var startTime, endTime pdata.TimestampUnixNano
+	if zSpan.Timestamp == 0 {
+		startTime = parsedAnnotations.earlyAnnotationTime
+		endTime = parsedAnnotations.lateAnnotationTime
+	} else {
+		startTime = microsecondsToUnixNano(zSpan.Timestamp)
+		endTime = microsecondsToUnixNano(zSpan.Timestamp + zSpan.Duration)
+	}
+	dest.SetStartTime(startTime)
+	dest.SetEndTime(endTime)
+
+	return nil
+}
+
+// microsecondsToUnixNano converts epoch microseconds to pdata.TimestampUnixNano
+// TODO: copypasted from jaeger converter - should it be moved to separate package?
+func microsecondsToUnixNano(ms int64) pdata.TimestampUnixNano {
+	return pdata.TimestampUnixNano(uint64(ms) * 1000)
+}
+
+// v1AnnotationParseResult stores the results of examining the original annotations,
+// this way multiple passes on the annotations are not needed.
+type v1AnnotationParseResult struct {
+	endpoint            *endpoint
+	events              pdata.SpanEventSlice
+	kind                pdata.SpanKind
+	extendedKind        tracetranslator.OpenTracingSpanKind
+	earlyAnnotationTime pdata.TimestampUnixNano
+	lateAnnotationTime  pdata.TimestampUnixNano
+}
+
+func parseV1Annotations(annotations []*annotation) *v1AnnotationParseResult {
+	earlyAnnotationTimestamp := int64(math.MaxInt64)
+	lateAnnotationTimestamp := int64(math.MinInt64)
+
+	events := pdata.NewSpanEventSlice()
+	events.Resize(len(annotations))
+
+	res := &v1AnnotationParseResult{
+		events: pdata.NewSpanEventSlice(),
+		kind:   pdata.SpanKindUNSPECIFIED,
+	}
+
+	// We want to set the span kind from the first annotation that contains information
+	// about the span kind. This flags ensures we only set span kind once from
+	// the first annotation.
+	spanKindIsSet := false
+
+	eventsCount := 0
+	for _, currAnnotation := range annotations {
+		if currAnnotation == nil || currAnnotation.Value == "" {
+			continue
+		}
+
+		endpointName := unknownServiceName
+		if currAnnotation.Endpoint != nil && currAnnotation.Endpoint.ServiceName != "" {
+			endpointName = currAnnotation.Endpoint.ServiceName
+		}
+
+		// Check if annotation has span kind information.
+		annotationHasSpanKind := false
+		switch currAnnotation.Value {
+		case "cs", "cr", "ms", "mr", "ss", "sr":
+			annotationHasSpanKind = true
+		}
+
+		// Populate the endpoint if it is not already populated and current endpoint
+		// has a service name and span kind.
+		if res.endpoint == nil && endpointName != unknownServiceName && annotationHasSpanKind {
+			res.endpoint = currAnnotation.Endpoint
+		}
+
+		if !spanKindIsSet && annotationHasSpanKind {
+			// We have not yet populated span kind, do it now.
+			// Translate from Zipkin span kind stored in Value field to Kind/ExternalKind
+			// pair of internal fields.
+			switch currAnnotation.Value {
+			case "cs", "cr":
+				res.kind = pdata.SpanKindCLIENT
+				res.extendedKind = tracetranslator.OpenTracingSpanKindClient
+
+			case "ms":
+				// "ms" and "mr" are PRODUCER and CONSUMER kinds which have no equivalent
+				// representation in OC. We keep res.Kind unspecified and will use
+				// ExtendedKind for translations.
+				res.extendedKind = tracetranslator.OpenTracingSpanKindProducer
+
+			case "mr":
+				res.extendedKind = tracetranslator.OpenTracingSpanKindConsumer
+
+			case "ss", "sr":
+				res.kind = pdata.SpanKindSERVER
+				res.extendedKind = tracetranslator.OpenTracingSpanKindServer
+			}
+
+			// Remember that we populated the span kind, so that we don't do it again.
+			spanKindIsSet = true
+		}
+
+		ts := microsecondsToUnixNano(currAnnotation.Timestamp)
+		if currAnnotation.Timestamp < earlyAnnotationTimestamp {
+			earlyAnnotationTimestamp = currAnnotation.Timestamp
+			res.earlyAnnotationTime = ts
+		}
+		if currAnnotation.Timestamp > lateAnnotationTimestamp {
+			lateAnnotationTimestamp = currAnnotation.Timestamp
+			res.lateAnnotationTime = ts
+		}
+
+		if annotationHasSpanKind {
+			// If this annotation is for the send/receive timestamps, no need to create the annotation
+			continue
+		}
+
+		event := pdata.NewSpanEvent()
+		event.SetTimestamp(ts)
+		event.SetName(currAnnotation.Value)
+		res.events.Append(pdata.NewSpanEvent())
+		eventsCount++
+	}
+
+	// Truncate the events slice to only include populated items.
+	res.events.Resize(eventsCount)
+
+	if res.endpoint == nil {
+		res.endpoint = &endpoint{
+			ServiceName: unknownServiceName,
+		}
+	}
+
+	return res
+}
+
+// parseV1BinAnnotations parses binary annotations to populate the provided pdata.Span
+// with pdata.AttributeMap and pdata.SpanStatus and to return the fallbackServiceName.
+func parseV1BinAnnotations(binAnnotations []*binaryAnnotation, parseStringTags bool, dest pdata.Span) (string, error) {
+	var localComponent, fallbackServiceName string
+	attrs := dest.Attributes()
+	sMapper := &statusMapper{}
+
+	for _, binAnnotation := range binAnnotations {
+		if binAnnotation.Endpoint != nil && binAnnotation.Endpoint.ServiceName != "" {
+			fallbackServiceName = binAnnotation.Endpoint.ServiceName
+		}
+
+		key := binAnnotation.Key
+		if key == zipkincore.LOCAL_COMPONENT {
+			// TODO: (@pjanotti) add reference to OpenTracing and change related tags to use them
+			key = "component"
+			localComponent = binAnnotation.Value
+		}
+
+		attrVal, err := parseInternalAttributeValue(binAnnotation.Value, parseStringTags)
+		if err != nil {
+			return "", err
+		}
+
+		if drop := sMapper.fromAttributeValue(key, attrVal); drop {
+			continue
+		}
+
+		attrs.Upsert(key, attrVal)
+	}
+
+	// Populate SpanStatus.
+	sMapper.toInternal(dest.Status())
+
+	if len(binAnnotations) == 0 {
+		return "", nil
+	}
+	if fallbackServiceName == "" {
+		fallbackServiceName = localComponent
+	}
+
+	return fallbackServiceName, nil
+}
+
+// parseInternalAttributeValue prepares a single pdata.AttributeValue from the provided raw string input.
+func parseInternalAttributeValue(value string, parseStringTags bool) (pdata.AttributeValue, error) {
+	attributeVal := pdata.NewAttributeValueNull()
+
+	if !parseStringTags {
+		attributeVal.SetStringVal(value)
+		return attributeVal, nil
+	}
+
+	switch tracetranslator.DetermineValueType(value, false) {
+	case pdata.AttributeValueINT:
+		v, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return attributeVal, fmt.Errorf("%s: %w", msgZipkinV1BinAnnotationError, err)
+		}
+		attributeVal.SetIntVal(v)
+
+	case pdata.AttributeValueDOUBLE:
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return attributeVal, fmt.Errorf("%s: %w", msgZipkinV1BinAnnotationError, err)
+		}
+		attributeVal.SetDoubleVal(v)
+
+	case pdata.AttributeValueBOOL:
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return attributeVal, fmt.Errorf("%s: %w", msgZipkinV1BinAnnotationError, err)
+		}
+		attributeVal.SetBoolVal(v)
+
+	default:
+		attributeVal.SetStringVal(value)
+	}
+
+	return attributeVal, nil
+}
+
+// zipkinV1SpanIDsToInternal populates pdata.Span with TraceID, SpanID and ParentID
+// from an instance of *zipkinV1Span.
+func zipkinV1SpanIDsToInternal(zSpan *zipkinV1Span, dest pdata.Span) error {
+	traceID, err := hexTraceIDToInternal(zSpan.TraceID)
+	if err != nil {
+		return err
+	}
+	dest.SetTraceID(traceID)
+
+	spanID, err := hexSpanIDToInternalID(zSpan.ID)
+	if err != nil {
+		return err
+	}
+	dest.SetSpanID(spanID)
+
+	if zSpan.ParentID != "" {
+		parentID, err := hexSpanIDToInternalID(zSpan.ParentID)
+		if err != nil {
+			return err
+		}
+		dest.SetParentSpanID(parentID)
+	}
+
+	return nil
+}
+
+// hexTraceIDToInternal transforms hex string trace ID representation
+// into a [16]byte internal pdata.TraceID.
+// Extra data is truncated to 16 bytes.
+func hexTraceIDToInternal(hex string) (pdata.TraceID, error) {
+	// Per info at https://zipkin.io/zipkin-api/zipkin-api.yaml it should be 16 or 32 characters.
+	hexLen := len(hex)
+	if hexLen != 16 && hexLen != 32 {
+		return pdata.InvalidTraceID(), errHexTraceIDWrongLen
+	}
+
+	var (
+		high, low uint64
+		err       error
+	)
+	if hexLen == 32 {
+		if high, err = strconv.ParseUint(hex[:16], 16, 64); err != nil {
+			return pdata.InvalidTraceID(), errHexTraceIDParsing
+		}
+	}
+
+	if low, err = strconv.ParseUint(hex[hexLen-16:], 16, 64); err != nil {
+		return pdata.InvalidTraceID(), errHexTraceIDParsing
+	}
+
+	if high == 0 && low == 0 {
+		return pdata.InvalidTraceID(), errHexTraceIDZero
+	}
+
+	tidBytes := tracetranslator.UInt64ToByteTraceID(high, low)
+
+	tid := [16]byte{}
+	copy(tid[:], tidBytes[:])
+
+	return pdata.NewTraceID(tid), nil
+}
+
+// hexSpanIDToInternalID transforms hex string span ID representation
+// into a [8]byte internal pdata.SpanID.
+// Extra data is truncated to 8 bytes.
+func hexSpanIDToInternalID(hex string) (pdata.SpanID, error) {
+	// Per info at https://zipkin.io/zipkin-api/zipkin-api.yaml it should be 16 characters
+	if len(hex) != 16 {
+		return pdata.InvalidSpanID(), errHexIDWrongLen
+	}
+
+	idValue, err := strconv.ParseUint(hex, 16, 64)
+	if err != nil {
+		return pdata.InvalidSpanID(), errHexIDParsing
+	}
+
+	if idValue == 0 {
+		return pdata.InvalidSpanID(), errHexIDZero
+	}
+
+	idBytes := tracetranslator.UInt64ToByteSpanID(idValue)
+
+	sid := [8]byte{}
+	copy(sid[:], idBytes[:])
+
+	return pdata.NewSpanID(sid), nil
 }
 
 type ocSpanAndParsedAnnotations struct {
@@ -128,60 +432,6 @@ func zipkinToOCProtoBatch(ocSpansAndParsedAnnotations []ocSpanAndParsedAnnotatio
 	return tds, nil
 }
 
-func zipkinV1ToOCSpan(zSpan *zipkinV1Span, parseStringTags bool) (*tracepb.Span, *annotationParseResult, error) {
-	traceID, err := hexTraceIDToOCTraceID(zSpan.TraceID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", msgZipkinV1TraceIDError, err)
-	}
-	spanID, err := hexIDToOCID(zSpan.ID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", msgZipkinV1SpanIDError, err)
-	}
-	var parentID []byte
-	if zSpan.ParentID != "" {
-		id, err := hexIDToOCID(zSpan.ParentID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%s: %w", msgZipkinV1ParentIDError, err)
-		}
-		parentID = id
-	}
-
-	parsedAnnotations := parseZipkinV1Annotations(zSpan.Annotations)
-	attributes, ocStatus, localComponent := zipkinV1BinAnnotationsToOCAttributes(zSpan.BinaryAnnotations, parseStringTags)
-	if parsedAnnotations.Endpoint.ServiceName == unknownServiceName && localComponent != "" {
-		parsedAnnotations.Endpoint.ServiceName = localComponent
-	}
-	var startTime, endTime *timestamppb.Timestamp
-	if zSpan.Timestamp == 0 {
-		startTime = parsedAnnotations.EarlyAnnotationTime
-		endTime = parsedAnnotations.LateAnnotationTime
-	} else {
-		startTime = epochMicrosecondsToTimestamp(zSpan.Timestamp)
-		endTime = epochMicrosecondsToTimestamp(zSpan.Timestamp + zSpan.Duration)
-	}
-
-	ocSpan := &tracepb.Span{
-		TraceId:      traceID,
-		SpanId:       spanID,
-		ParentSpanId: parentID,
-		Status:       ocStatus,
-		Kind:         parsedAnnotations.Kind,
-		TimeEvents:   parsedAnnotations.TimeEvents,
-		StartTime:    startTime,
-		EndTime:      endTime,
-		Attributes:   attributes,
-	}
-
-	if zSpan.Name != "" {
-		ocSpan.Name = &tracepb.TruncatableString{Value: zSpan.Name}
-	}
-
-	setSpanKind(ocSpan, parsedAnnotations.Kind, parsedAnnotations.ExtendedKind)
-	setTimestampsIfUnset(ocSpan)
-
-	return ocSpan, parsedAnnotations, nil
-}
-
 func setSpanKind(ocSpan *tracepb.Span, kind tracepb.Span_SpanKind, extendedKind tracetranslator.OpenTracingSpanKind) {
 	if kind == tracepb.Span_SPAN_KIND_UNSPECIFIED &&
 		extendedKind != tracetranslator.OpenTracingSpanKindUnspecified {
@@ -200,78 +450,6 @@ func setSpanKind(ocSpan *tracepb.Span, kind tracepb.Span_SpanKind, extendedKind 
 				StringValue: &tracepb.TruncatableString{Value: string(extendedKind)},
 			}}
 	}
-}
-
-func zipkinV1BinAnnotationsToOCAttributes(binAnnotations []*binaryAnnotation, parseStringTags bool) (attributes *tracepb.Span_Attributes, status *tracepb.Status, fallbackServiceName string) {
-	if len(binAnnotations) == 0 {
-		return nil, nil, ""
-	}
-
-	sMapper := &statusMapper{}
-	var localComponent string
-	attributeMap := make(map[string]*tracepb.AttributeValue)
-	for _, binAnnotation := range binAnnotations {
-
-		if binAnnotation.Endpoint != nil && binAnnotation.Endpoint.ServiceName != "" {
-			fallbackServiceName = binAnnotation.Endpoint.ServiceName
-		}
-
-		pbAttrib := parseAnnotationValue(binAnnotation.Value, parseStringTags)
-
-		key := binAnnotation.Key
-
-		if key == zipkincore.LOCAL_COMPONENT {
-			// TODO: (@pjanotti) add reference to OpenTracing and change related tags to use them
-			key = "component"
-			localComponent = binAnnotation.Value
-		}
-
-		if drop := sMapper.fromAttribute(key, pbAttrib); drop {
-			continue
-		}
-
-		attributeMap[key] = pbAttrib
-	}
-
-	status = sMapper.ocStatus()
-
-	if len(attributeMap) == 0 {
-		return nil, status, ""
-	}
-
-	if fallbackServiceName == "" {
-		fallbackServiceName = localComponent
-	}
-
-	attributes = &tracepb.Span_Attributes{
-		AttributeMap: attributeMap,
-	}
-
-	return attributes, status, fallbackServiceName
-}
-
-func parseAnnotationValue(value string, parseStringTags bool) *tracepb.AttributeValue {
-	pbAttrib := &tracepb.AttributeValue{}
-
-	if parseStringTags {
-		switch tracetranslator.DetermineValueType(value, false) {
-		case pdata.AttributeValueINT:
-			iValue, _ := strconv.ParseInt(value, 10, 64)
-			pbAttrib.Value = &tracepb.AttributeValue_IntValue{IntValue: iValue}
-		case pdata.AttributeValueDOUBLE:
-			fValue, _ := strconv.ParseFloat(value, 64)
-			pbAttrib.Value = &tracepb.AttributeValue_DoubleValue{DoubleValue: fValue}
-		case pdata.AttributeValueBOOL:
-			bValue, _ := strconv.ParseBool(value)
-			pbAttrib.Value = &tracepb.AttributeValue_BoolValue{BoolValue: bValue}
-		default:
-			pbAttrib.Value = &tracepb.AttributeValue_StringValue{StringValue: &tracepb.TruncatableString{Value: value}}
-		}
-	} else {
-		pbAttrib.Value = &tracepb.AttributeValue_StringValue{StringValue: &tracepb.TruncatableString{Value: value}}
-	}
-
-	return pbAttrib
 }
 
 // annotationParseResult stores the results of examining the original annotations,
@@ -390,52 +568,6 @@ func parseZipkinV1Annotations(annotations []*annotation) *annotationParseResult 
 	}
 
 	return res
-}
-
-func hexTraceIDToOCTraceID(hex string) ([]byte, error) {
-	// Per info at https://zipkin.io/zipkin-api/zipkin-api.yaml it should be 16 or 32 characters
-	hexLen := len(hex)
-	if hexLen != 16 && hexLen != 32 {
-		return nil, errHexTraceIDWrongLen
-	}
-
-	var high, low uint64
-	var err error
-	if hexLen == 32 {
-		if high, err = strconv.ParseUint(hex[:16], 16, 64); err != nil {
-			return nil, errHexTraceIDParsing
-		}
-	}
-
-	if low, err = strconv.ParseUint(hex[hexLen-16:], 16, 64); err != nil {
-		return nil, errHexTraceIDParsing
-	}
-
-	if high == 0 && low == 0 {
-		return nil, errHexTraceIDZero
-	}
-
-	tidBytes := tracetranslator.UInt64ToByteTraceID(high, low)
-	return tidBytes[:], nil
-}
-
-func hexIDToOCID(hex string) ([]byte, error) {
-	// Per info at https://zipkin.io/zipkin-api/zipkin-api.yaml it should be 16 characters
-	if len(hex) != 16 {
-		return nil, errHexIDWrongLen
-	}
-
-	idValue, err := strconv.ParseUint(hex, 16, 64)
-	if err != nil {
-		return nil, errHexIDParsing
-	}
-
-	if idValue == 0 {
-		return nil, errHexIDZero
-	}
-
-	idBytes := tracetranslator.UInt64ToByteSpanID(idValue)
-	return idBytes[:], nil
 }
 
 func epochMicrosecondsToTimestamp(msecs int64) *timestamppb.Timestamp {

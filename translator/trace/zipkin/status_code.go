@@ -21,6 +21,7 @@ import (
 
 	tracepb "github.com/census-instrumentation/opencensus-proto/gen-go/trace/v1"
 
+	"go.opentelemetry.io/collector/consumer/pdata"
 	tracetranslator "go.opentelemetry.io/collector/translator/trace"
 )
 
@@ -41,6 +42,134 @@ type statusMapper struct {
 	fromErrorTag status
 	// oc status code 'unknown' when the "error" tag exists but is invalid
 	fromErrorTagUnknown status
+}
+
+func (m *statusMapper) fromAttributeValue(key string, attrVal pdata.AttributeValue) bool {
+	switch key {
+	case tracetranslator.TagZipkinCensusCode:
+		code, err := attributeValueToStatusCode(attrVal)
+		if err == nil {
+			m.fromCensus.codePtr = &code
+		}
+		return true
+
+	case tracetranslator.TagZipkinCensusMsg, tracetranslator.TagZipkinOpenCensusMsg:
+		m.fromCensus.message = attrVal.StringVal()
+		return true
+
+	case tracetranslator.TagStatusCode:
+		code, err := attributeValueToStatusCode(attrVal)
+		if err == nil {
+			m.fromStatus.codePtr = &code
+		}
+		return true
+
+	case tracetranslator.TagStatusMsg:
+		m.fromStatus.message = attrVal.StringVal()
+		return true
+
+	case tracetranslator.TagHTTPStatusCode:
+		httpCode, err := attributeValueToStatusCode(attrVal)
+		if err == nil {
+			code := tracetranslator.OCStatusCodeFromHTTP(httpCode)
+			m.fromHTTP.codePtr = &code
+		}
+
+	case tracetranslator.TagHTTPStatusMsg:
+		m.fromHTTP.message = attrVal.StringVal()
+
+	case tracetranslator.TagError:
+		code, ok := statusFromError(attrVal)
+		if ok {
+			m.fromErrorTag.codePtr = code
+			return true
+		}
+		m.fromErrorTagUnknown.codePtr = code
+	}
+
+	return false
+}
+
+// attributeValueToStatusCode maps an integer or string attribute value to a status code.
+// The function return nil if the value is of another type or cannot be converted to an int32 value.
+func attributeValueToStatusCode(attrVal pdata.AttributeValue) (int32, error) {
+	switch attrVal.Type() {
+	case pdata.AttributeValueINT:
+		return int64ToInt32(attrVal.IntVal())
+	case pdata.AttributeValueSTRING:
+		i, err := strconv.Atoi(attrVal.StringVal())
+		if err != nil {
+			return 0, err
+		}
+		return intToInt32(i)
+	}
+
+	return 0, fmt.Errorf("invalid attribute type")
+}
+
+func int64ToInt32(i int64) (int32, error) {
+	if i <= math.MaxInt32 && i >= math.MinInt32 {
+		return int32(i), nil
+	}
+	return 0, fmt.Errorf("int64 outside of the int32 range")
+}
+
+// TODO: remove toInt32 after OpenCensus helpers are removed from this file.
+func intToInt32(i int) (int32, error) {
+	return toInt32(i)
+}
+
+func statusFromError(attrVal pdata.AttributeValue) (*int32, bool) {
+	// The status is stored with the "error" key
+	// See https://github.com/census-instrumentation/opencensus-go/blob/1eb9a13c7dd02141e065a665f6bf5c99a090a16a/exporter/zipkin/zipkin.go#L160-L165
+	var unknown int32 = 2
+
+	if attrVal.Type() == pdata.AttributeValueSTRING {
+		canonicalCodeStr := attrVal.StringVal()
+		if canonicalCodeStr == "" {
+			return nil, true
+		}
+		code, set := canonicalCodesMap[canonicalCodeStr]
+		if set {
+			return &code, true
+		}
+	}
+
+	return &unknown, false
+}
+
+// toInternal populates a pdata.SpanStatus from the best possible extraction source.
+// It'll first try to return status extracted from "census.status_code" to account for Zipkin
+// then fallback on code extracted from "status.code" tags
+// and finally fallback on code extracted and translated from "http.status_code".
+// toInternal must be called after all tags/attributes are processed with the fromAttributeValue method.
+func (m *statusMapper) toInternal(dest pdata.SpanStatus) {
+	var s status
+	switch {
+	case m.fromCensus.codePtr != nil:
+		s = m.fromCensus
+	case m.fromStatus.codePtr != nil:
+		s = m.fromStatus
+	case m.fromErrorTag.codePtr != nil:
+		s = m.fromErrorTag
+		if m.fromCensus.message != "" {
+			s.message = m.fromCensus.message
+		} else if m.fromStatus.message != "" {
+			s.message = m.fromStatus.message
+		}
+	case m.fromHTTP.codePtr != nil:
+		s = m.fromHTTP
+	default:
+		s = m.fromErrorTagUnknown
+	}
+
+	code := pdata.StatusCodeUnset
+	if s.codePtr != nil {
+		code = pdata.StatusCode(*s.codePtr)
+	}
+
+	dest.SetCode(code)
+	dest.SetMessage(s.message)
 }
 
 // ocStatus returns an OC status from the best possible extraction source.

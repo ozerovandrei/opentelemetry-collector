@@ -16,20 +16,35 @@ package zipkin
 
 import (
 	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/internaldata"
 )
 
 func V1JSONBatchToInternalTraces(blob []byte, parseStringTags bool) (pdata.Traces, error) {
-	traces := pdata.NewTraces()
+	traceData := pdata.NewTraces()
 
-	ocTraces, err := v1JSONBatchToOCProto(blob, parseStringTags)
+	zSpans, err := v1JSONBatchToZipkinV1Spans(blob)
 	if err != nil {
-		return traces, err
+		return traceData, err
 	}
 
-	for _, td := range ocTraces {
-		tmp := internaldata.OCToTraceData(td)
-		tmp.ResourceSpans().MoveAndAppendTo(traces.ResourceSpans())
+	// Allocate a slice with a single Resource.
+	rss := traceData.ResourceSpans()
+	rss.Resize(1)
+	rs0 := rss.At(0)
+
+	// Allocate a slice for spans that need to be combined into ResourceSpans.
+	ilss := rs0.InstrumentationLibrarySpans()
+	ilss.Resize(1)
+	ils0 := ilss.At(0)
+
+	// Allocate a slice for all converted spans.
+	combinedSpans := ils0.Spans()
+	combinedSpans.Resize(len(zSpans))
+
+	for zSpanIdx, zSpan := range zSpans {
+		if err := zipkinV1SpanToInternal(zSpan, parseStringTags, combinedSpans.At(zSpanIdx)); err != nil {
+			return traceData, err
+		}
 	}
-	return traces, nil
+
+	return traceData, nil
 }
